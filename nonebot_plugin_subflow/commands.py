@@ -274,7 +274,7 @@ async def _handle_set_pipeline(
         raw = args.extract_plain_text().strip()
         if " " not in raw:
             await set_pipeline_matcher.finish(
-                "用法：/设置流水线 <番剧名> 翻译[分段],时轴[分段] → 校对 → ..."
+                "用法：/设置流水线 <番剧名> 翻译[分段] → 时轴[分段] → 校对 → ..."
             )
         show, dsl = raw.split(" ", 1)
         bindings = deps.require_bindings()

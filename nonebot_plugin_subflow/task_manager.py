@@ -142,6 +142,14 @@ def normalize_segment(raw: str) -> str:
     return s
 
 
+def _stage_is_segmented(pipeline: Pipeline, stage_name: str) -> bool:
+    """从 pipeline 查 stage 是否标了 [分段]。stage 不在 pipeline 时返回 False。"""
+    for s in pipeline:
+        if s.stage == stage_name:
+            return s.segment
+    return False
+
+
 def _episodes_eq(a: str, b: str) -> bool:
     return normalize_episode(a) == normalize_episode(b)
 
@@ -177,7 +185,10 @@ class CompleteOutcome:
     original_assignee_raw: str  # 完成前的「组员」字段值（QQ 数字串 或 昵称）
     sender_was_assignee: bool
     same_stage_remaining: int       # 同集同工序剩余未完成的段数
-    newly_unlocked_stages: list[str]  # 因此次完成而新解锁的下游工序
+    # D13：因此次完成而新解锁的下游任务，元素是 (stage, segment) — segment="0" 表示不分段
+    newly_unlocked_tasks: list[tuple[str, str]]
+    # 兼容字段：上面 list 里去重后的 stage 名顺序
+    newly_unlocked_stages: list[str]
     blocking_stages: list[str]      # 是下游、但仍因别的工序未完成而被阻塞
 
 
@@ -479,15 +490,18 @@ class TaskManager:
                 raise TaskAlreadyAssignedError(
                     f"任务已被 {holder} 接走（当前状态：{current.values.get(COL_PROGRESS)}）"
                 )
-            # 前置工序校验（D10：用集快照）
+            # 前置工序校验（D10：用集快照；D13：传 segment 走同段依赖）
             episode_records = self._episode_records(binding, episode)
             pipeline = self._pipelines.get_episode_pipeline(show, episode)
-            if not self._is_stage_unlocked(pipeline, episode_records, stage):
+            current_segment = str(current.values.get(COL_SEGMENT) or "")
+            if not self._is_stage_unlocked(
+                pipeline, episode_records, stage, segment=current_segment
+            ):
                 blockers = self._blocking_predecessors(
-                    pipeline, episode_records, stage
+                    pipeline, episode_records, stage, segment=current_segment
                 )
                 raise PredecessorNotDoneError(
-                    f"前置工序未全部完成：{blockers}"
+                    f"前置任务未完成：{blockers}"
                 )
             # 用户配额
             if self._max_tasks_per_user > 0:
@@ -567,26 +581,56 @@ class TaskManager:
                 and r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
             )
 
-            newly_unlocked: list[str] = []
+            # D13：per-(stage, segment) 粒度探测新解锁
+            just_completed_segment = str(updated.values.get(COL_SEGMENT) or "")
+            pred_segmented = _stage_is_segmented(pipeline, stage)
+            newly_unlocked_tasks: list[tuple[str, str]] = []
             still_blocked: list[str] = []
             for downstream in downstream_of(pipeline, stage):
-                was_unlocked = self._is_stage_unlocked(
-                    pipeline, pre_records, downstream.stage
-                )
-                is_unlocked = self._is_stage_unlocked(
-                    pipeline, post_records, downstream.stage
-                )
-                has_unassigned = any(
-                    r.values.get(COL_TYPE) == downstream.stage
-                    and r.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED
-                    for r in post_records
-                )
-                if not has_unassigned:
+                ds_segmented = downstream.segment
+                # 候选下游记录：
+                # - 同段-同段时仅检查与本次完成同段的那一条
+                # - 否则检查该下游 stage 的所有未分配记录
+                if ds_segmented and pred_segmented:
+                    candidates = [
+                        r for r in post_records
+                        if r.values.get(COL_TYPE) == downstream.stage
+                        and r.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED
+                        and normalize_segment(r.values.get(COL_SEGMENT, ""))
+                            == normalize_segment(just_completed_segment)
+                    ]
+                else:
+                    candidates = [
+                        r for r in post_records
+                        if r.values.get(COL_TYPE) == downstream.stage
+                        and r.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED
+                    ]
+                if not candidates:
                     continue
-                if not was_unlocked and is_unlocked:
-                    newly_unlocked.append(downstream.stage)
-                elif not is_unlocked:
+                stage_blocked = False
+                for cand in candidates:
+                    seg = str(cand.values.get(COL_SEGMENT) or "")
+                    check_seg = seg if ds_segmented else None
+                    was = self._is_stage_unlocked(
+                        pipeline, pre_records, downstream.stage,
+                        segment=check_seg,
+                    )
+                    is_now = self._is_stage_unlocked(
+                        pipeline, post_records, downstream.stage,
+                        segment=check_seg,
+                    )
+                    if not was and is_now:
+                        newly_unlocked_tasks.append((downstream.stage, seg))
+                    elif not is_now:
+                        stage_blocked = True
+                if stage_blocked and downstream.stage not in still_blocked:
                     still_blocked.append(downstream.stage)
+
+            # 去重 stage 名（保持顺序）
+            newly_unlocked_stage_names: list[str] = []
+            for s, _ in newly_unlocked_tasks:
+                if s not in newly_unlocked_stage_names:
+                    newly_unlocked_stage_names.append(s)
 
         return CompleteOutcome(
             task=updated,
@@ -595,7 +639,8 @@ class TaskManager:
             original_assignee_raw=original_assignee,
             sender_was_assignee=sender_is_assignee,
             same_stage_remaining=same_stage_remaining,
-            newly_unlocked_stages=newly_unlocked,
+            newly_unlocked_tasks=newly_unlocked_tasks,
+            newly_unlocked_stages=newly_unlocked_stage_names,
             blocking_stages=still_blocked,
         )
 
@@ -939,7 +984,11 @@ class TaskManager:
                     if rec.values.get(COL_PROGRESS) != PROGRESS_UNASSIGNED:
                         continue
                     stage = rec.values.get(COL_TYPE)
-                    if not self._is_stage_unlocked(pipeline, ep_records, stage):
+                    # D13：按本记录的 segment 算同段依赖
+                    seg = str(rec.values.get(COL_SEGMENT) or "")
+                    if not self._is_stage_unlocked(
+                        pipeline, ep_records, stage, segment=seg
+                    ):
                         continue
                     out.append((entry.alias, rec))
         return out
@@ -987,19 +1036,42 @@ class TaskManager:
         pipeline: Pipeline,
         episode_records: list[Record],
         stage_name: str,
+        segment: str | None = None,
     ) -> bool:
-        preds = predecessors_of(pipeline, stage_name)
-        for p in preds:
+        """D13：检查指定 (stage, segment) 是否所有前置完成。
+
+        - 当下游和某条前置**都是 [分段]** 工序，且 segment 给了 →
+          按"同段"匹配（只看相同 segment 的前置记录）
+        - 否则（任一不分段，或不指定 segment）→ 按"全段完成"匹配（旧行为）
+        - 前置工序在本集没有任何记录 → vacuous truth，视为满足
+        """
+        downstream_segmented = _stage_is_segmented(pipeline, stage_name)
+        for p in predecessors_of(pipeline, stage_name):
             p_records = [
                 r for r in episode_records if r.values.get(COL_TYPE) == p
             ]
             if not p_records:
-                continue  # vacuous truth：该集没有这道前置工序
-            if any(
-                r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
-                for r in p_records
-            ):
-                return False
+                continue
+            pred_segmented = _stage_is_segmented(pipeline, p)
+            if downstream_segmented and pred_segmented and segment is not None:
+                target = normalize_segment(segment)
+                same_seg = [
+                    r for r in p_records
+                    if normalize_segment(r.values.get(COL_SEGMENT, "")) == target
+                ]
+                if not same_seg:
+                    continue  # 该段在前置不存在（异常分段数错配）→ 视为满足
+                if any(
+                    r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
+                    for r in same_seg
+                ):
+                    return False
+            else:
+                if any(
+                    r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
+                    for r in p_records
+                ):
+                    return False
         return True
 
     def _blocking_predecessors(
@@ -1007,17 +1079,36 @@ class TaskManager:
         pipeline: Pipeline,
         episode_records: list[Record],
         stage_name: str,
+        segment: str | None = None,
     ) -> list[str]:
+        """返回阻塞当前 (stage, segment) 的前置描述列表。
+        分段-分段同段匹配时返回 "翻译 1" 这种带段号的；其它返回"翻译"。"""
         out: list[str] = []
+        downstream_segmented = _stage_is_segmented(pipeline, stage_name)
         for p in predecessors_of(pipeline, stage_name):
             p_records = [
                 r for r in episode_records if r.values.get(COL_TYPE) == p
             ]
-            if p_records and any(
-                r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
-                for r in p_records
-            ):
-                out.append(p)
+            if not p_records:
+                continue
+            pred_segmented = _stage_is_segmented(pipeline, p)
+            if downstream_segmented and pred_segmented and segment is not None:
+                target = normalize_segment(segment)
+                relevant = [
+                    r for r in p_records
+                    if normalize_segment(r.values.get(COL_SEGMENT, "")) == target
+                ]
+                if relevant and any(
+                    r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
+                    for r in relevant
+                ):
+                    out.append(f"{p} {segment}")
+            else:
+                if any(
+                    r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
+                    for r in p_records
+                ):
+                    out.append(p)
         return out
 
     def _count_user_active(self, user_qq: int) -> int:

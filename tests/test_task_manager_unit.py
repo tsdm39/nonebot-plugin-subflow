@@ -571,3 +571,133 @@ async def test_update_task_changes_arbitrary_field(tm: TaskManager) -> None:
     )
     assert outcome.task.values[COL_REMARK] == "加急"
     assert outcome.changed_fields == {COL_REMARK: "加急"}
+
+
+# ============================================================ D13: 同段串行依赖（arrow DSL）
+
+
+ARROW_DSL = "翻译[分段] → 时轴[分段] → 校对 → 后期 → 监制 → 压制"
+
+
+@pytest.fixture
+def arrow_setup(tmp_path: Path):
+    fake = FakeStorage()
+    cache = SheetCache(fake, sync_interval_minutes=99999)
+    bindings = BindingStore.load(tmp_path / "bindings.json", main_group_id=111)
+    binding = bindings.bind(
+        group_id=ALIAS_GROUP, alias=SHOW, file_id="F", sheet_id="S", bound_by=987
+    )
+    pipelines = PipelineStore.load(
+        config_path=tmp_path / "pipelines.json",
+        snapshot_path=tmp_path / "episode_pipelines.json",
+        default_pipeline_dsl=ARROW_DSL,
+    )
+    return {"fake": fake, "cache": cache, "bindings": bindings, "binding": binding, "pipelines": pipelines}
+
+
+@pytest.fixture
+def arrow_tm(arrow_setup):
+    return TaskManager(
+        cache=arrow_setup["cache"],
+        bindings=arrow_setup["bindings"],
+        pipelines=arrow_setup["pipelines"],
+        max_tasks_per_user=99,
+        confirm_timeout_seconds=30,
+    )
+
+
+async def test_d13_per_segment_unlock_only_matching_segment(
+    arrow_tm: TaskManager,
+) -> None:
+    """完成 翻译 1 → 时轴 1 解锁（仅本段）；时轴 2/3 仍阻塞。"""
+    await arrow_tm.create_episode(SHOW, "07", 3)
+    await arrow_tm.claim_task(SHOW, "07", "翻译", "1", user_qq=100)
+    outcome = await arrow_tm.complete_task(SHOW, "07", "翻译", "1", user_qq=100)
+    assert ("时轴", "1") in outcome.newly_unlocked_tasks
+    # 时轴 2/3 不在 newly_unlocked，因为对应的 翻译 2/3 还没完成
+    unlocked_pairs = set(outcome.newly_unlocked_tasks)
+    assert ("时轴", "2") not in unlocked_pairs
+    assert ("时轴", "3") not in unlocked_pairs
+
+
+async def test_d13_claim_segmented_blocked_by_same_segment_only(
+    arrow_tm: TaskManager,
+) -> None:
+    """试图接 时轴 2，但 翻译 2 没完 → blocked；与 翻译 1/3 状态无关。"""
+    await arrow_tm.create_episode(SHOW, "07", 3)
+    # 完成 翻译 1（不应影响 时轴 2 的依赖）
+    await arrow_tm.claim_task(SHOW, "07", "翻译", "1", user_qq=100)
+    await arrow_tm.complete_task(SHOW, "07", "翻译", "1", user_qq=100)
+    # 接 时轴 2 应失败 — 因为 翻译 2 未完成
+    with pytest.raises(PredecessorNotDoneError) as exc:
+        await arrow_tm.claim_task(SHOW, "07", "时轴", "2", user_qq=200)
+    # 错误信息应含段号（"翻译 2"）
+    assert "翻译 2" in str(exc.value)
+
+
+async def test_d13_claim_segmented_works_when_same_segment_complete(
+    arrow_tm: TaskManager,
+) -> None:
+    """翻译 2 完成后，时轴 2 可接，但 时轴 3 仍 blocked。"""
+    await arrow_tm.create_episode(SHOW, "07", 3)
+    # 完成 翻译 2
+    await arrow_tm.claim_task(SHOW, "07", "翻译", "2", user_qq=100)
+    await arrow_tm.complete_task(SHOW, "07", "翻译", "2", user_qq=100)
+    # 时轴 2 应能接
+    outcome = await arrow_tm.claim_task(SHOW, "07", "时轴", "2", user_qq=200)
+    assert outcome.task.values[COL_SEGMENT] == "2"
+    # 时轴 3 仍 blocked
+    with pytest.raises(PredecessorNotDoneError):
+        await arrow_tm.claim_task(SHOW, "07", "时轴", "3", user_qq=200)
+
+
+async def test_d13_segmented_to_unsegmented_uses_all_done(
+    arrow_tm: TaskManager,
+) -> None:
+    """翻译[分段] → 时轴[分段] → 校对（不分段）：校对要等全部时轴段完才解锁。"""
+    await arrow_tm.create_episode(SHOW, "07", 2)
+    # 全部翻译/时轴完成
+    for seg in ("1", "2"):
+        await arrow_tm.claim_task(SHOW, "07", "翻译", seg, user_qq=100)
+        await arrow_tm.complete_task(SHOW, "07", "翻译", seg, user_qq=100)
+    # 完成 时轴 1 — 校对应仍 blocked
+    await arrow_tm.claim_task(SHOW, "07", "时轴", "1", user_qq=200)
+    o1 = await arrow_tm.complete_task(SHOW, "07", "时轴", "1", user_qq=200)
+    assert ("校对", "0") not in o1.newly_unlocked_tasks
+    assert "校对" in o1.blocking_stages
+    # 完成 时轴 2 — 校对终于解锁
+    await arrow_tm.claim_task(SHOW, "07", "时轴", "2", user_qq=300)
+    o2 = await arrow_tm.complete_task(SHOW, "07", "时轴", "2", user_qq=300)
+    assert ("校对", "0") in o2.newly_unlocked_tasks
+
+
+async def test_d13_list_available_filters_by_same_segment(
+    arrow_tm: TaskManager,
+) -> None:
+    """list_available 应正确按段过滤：初始只有翻译三段可接，时轴全 blocked。"""
+    await arrow_tm.create_episode(SHOW, "07", 3)
+    avail = arrow_tm.list_available()
+    by_type: dict[str, list[str]] = {}
+    for _, rec in avail:
+        by_type.setdefault(rec.values[COL_TYPE], []).append(rec.values[COL_SEGMENT])
+    assert sorted(by_type.get("翻译", [])) == ["1", "2", "3"]
+    assert "时轴" not in by_type  # 全 blocked
+
+    # 完成 翻译 2 → 时轴 2 应进入 available
+    await arrow_tm.claim_task(SHOW, "07", "翻译", "2", user_qq=100)
+    await arrow_tm.complete_task(SHOW, "07", "翻译", "2", user_qq=100)
+    avail2 = arrow_tm.list_available()
+    timing_segs = sorted(
+        rec.values[COL_SEGMENT]
+        for _, rec in avail2
+        if rec.values[COL_TYPE] == "时轴"
+    )
+    assert timing_segs == ["2"]
+
+
+async def test_d13_unsegmented_pipeline_unaffected(arrow_tm: TaskManager) -> None:
+    """单段集（segment_count=1）：行为与旧版本等价 — 翻译 1 完成解锁 时轴 1。"""
+    await arrow_tm.create_episode(SHOW, "07", 1)
+    await arrow_tm.claim_task(SHOW, "07", "翻译", "1", user_qq=100)
+    o = await arrow_tm.complete_task(SHOW, "07", "翻译", "1", user_qq=100)
+    assert ("时轴", "1") in o.newly_unlocked_tasks

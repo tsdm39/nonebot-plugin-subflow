@@ -108,16 +108,34 @@ def render_complete(outcome: CompleteOutcome) -> Message:
             f"\n{outcome.ref.stage} 还剩 {outcome.same_stage_remaining} 个分段未完成"
         )
 
-    # 下游解锁
-    for stage in outcome.newly_unlocked_stages:
+    # 下游解锁 — D13：精确到 (stage, segment) 粒度
+    # 同 stage 多段一起解锁时合并成一行避免刷屏
+    by_stage: dict[str, list[str]] = {}
+    order: list[str] = []
+    for stage, seg in outcome.newly_unlocked_tasks:
+        if stage not in by_stage:
+            by_stage[stage] = []
+            order.append(stage)
+        by_stage[stage].append(seg)
+    for stage in order:
+        segs = by_stage[stage]
+        if len(segs) == 1 and segs[0] != SEGMENT_NONE:
+            label = f"{stage} {segs[0]}"
+            cmd = f"/接活 {outcome.ref.show} {outcome.ref.episode} {stage} {segs[0]}"
+        elif len(segs) == 1 and segs[0] == SEGMENT_NONE:
+            label = stage
+            cmd = f"/接活 {outcome.ref.show} {outcome.ref.episode} {stage}"
+        else:
+            # 多段同时解锁
+            seg_list = "/".join(segs)
+            label = f"{stage} {seg_list}"
+            cmd = f"/接活 {outcome.ref.show} {outcome.ref.episode} {stage} <段号>"
         msg += MessageSegment.text(
-            f"\n🎉 {stage} 现在可以接了 → /接活 {outcome.ref.show} "
-            f"{outcome.ref.episode} {stage}"
+            f"\n🎉 {label} 现在可以接了 → {cmd}"
         )
 
     # 仍阻塞的下游（信息性）
-    if outcome.blocking_stages and not outcome.newly_unlocked_stages:
-        # 只有同工序全完成才提；如果同工序还有剩余则上面已经说了
+    if outcome.blocking_stages and not outcome.newly_unlocked_tasks:
         if outcome.same_stage_remaining == 0:
             blockers = "/".join(outcome.blocking_stages)
             msg += MessageSegment.text(

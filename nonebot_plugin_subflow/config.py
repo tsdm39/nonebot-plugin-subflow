@@ -72,5 +72,5 @@ class Config(BaseModel):
     subflow_token_warn_days: int = 7  # 天
     subflow_data_dir: str = "./data"
     subflow_default_pipeline: str = (
-        "翻译[分段],时轴[分段] → 校对 → 后期 → 监制 → 压制"
+        "翻译[分段] → 时轴[分段] → 校对 → 后期 → 监制 → 压制"
     )

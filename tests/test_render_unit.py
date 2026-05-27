@@ -108,6 +108,7 @@ def test_render_complete_normal_path_no_warning() -> None:
         original_assignee_raw="100",
         sender_was_assignee=True,
         same_stage_remaining=0,
+        newly_unlocked_tasks=[],
         newly_unlocked_stages=[],
         blocking_stages=[],
     )
@@ -125,6 +126,7 @@ def test_render_complete_non_assignee_qq_warning() -> None:
         original_assignee_raw="100",
         sender_was_assignee=False,
         same_stage_remaining=0,
+        newly_unlocked_tasks=[],
         newly_unlocked_stages=[],
         blocking_stages=[],
     )
@@ -143,6 +145,7 @@ def test_render_complete_non_assignee_nickname_warning() -> None:
         original_assignee_raw="小明同学",
         sender_was_assignee=False,
         same_stage_remaining=0,
+        newly_unlocked_tasks=[],
         newly_unlocked_stages=[],
         blocking_stages=[],
     )
@@ -160,6 +163,7 @@ def test_render_complete_with_remaining_segments() -> None:
         original_assignee_raw="100",
         sender_was_assignee=True,
         same_stage_remaining=2,
+        newly_unlocked_tasks=[],
         newly_unlocked_stages=[],
         blocking_stages=[],
     )
@@ -175,6 +179,7 @@ def test_render_complete_with_newly_unlocked() -> None:
         original_assignee_raw="100",
         sender_was_assignee=True,
         same_stage_remaining=0,
+        newly_unlocked_tasks=[("校对", "0")],
         newly_unlocked_stages=["校对"],
         blocking_stages=[],
     )
@@ -182,6 +187,61 @@ def test_render_complete_with_newly_unlocked() -> None:
     assert "🎉" in text
     assert "校对 现在可以接了" in text
     assert "/接活 淡岛百景 07 校对" in text
+
+
+def test_render_complete_per_segment_unlock_message() -> None:
+    """D13：渲染应输出"时轴 1 现在可以接了 → /接活 ... 时轴 1"（精确到段）"""
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=2,
+        newly_unlocked_tasks=[("时轴", "1")],
+        newly_unlocked_stages=["时轴"],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "时轴 1 现在可以接了" in text
+    assert "/接活 淡岛百景 07 时轴 1" in text
+
+
+def test_render_complete_unsegmented_unlock_no_segment_in_command() -> None:
+    """不分段下游解锁 segment='0' 时，命令里不带段号。"""
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=0,
+        newly_unlocked_tasks=[("校对", "0")],
+        newly_unlocked_stages=["校对"],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "校对 现在可以接了" in text
+    assert "/接活 淡岛百景 07 校对" in text
+    assert "校对 0" not in text  # 不带 0
+
+
+def test_render_complete_multiple_segments_unlocked_together() -> None:
+    """同一 stage 多个段同时解锁 → 合并成一行避免刷屏。"""
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=0,
+        newly_unlocked_tasks=[("后期", "1"), ("后期", "2"), ("后期", "3")],
+        newly_unlocked_stages=["后期"],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "后期 1/2/3" in text
+    assert text.count("🎉") == 1  # 合并成一行
 
 
 def test_render_complete_with_blocking_stages_when_no_unlock() -> None:
@@ -193,6 +253,7 @@ def test_render_complete_with_blocking_stages_when_no_unlock() -> None:
         original_assignee_raw="100",
         sender_was_assignee=True,
         same_stage_remaining=0,
+        newly_unlocked_tasks=[],
         newly_unlocked_stages=[],
         blocking_stages=["校对"],
     )

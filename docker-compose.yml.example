@@ -5,12 +5,12 @@ services:
     image: subflow-bot:latest
     container_name: subflow-bot
     restart: unless-stopped
-    env_file: .env
+    # 不用 env_file —— 用文件挂载，改 .env 后 `docker compose restart nonebot` 即可，无需 down+up
     ports:
       - "8080:8080"  # OneBot v11 反向 WS / HTTP API；NapCat 连这里
     volumes:
       - ./data:/app/data     # 持久化 bindings/pipelines/episode_pipelines
-      - ./.env:/app/.env:ro  # 环境变量（含 access_token，注意权限）
+      - ./.env:/app/.env:ro  # 环境变量文件，NoneBot 启动时从 cwd 的 .env 读取
     # 启用容器化 NapCat 时取消下面 4 行注释
     # depends_on:
     #   napcat:
