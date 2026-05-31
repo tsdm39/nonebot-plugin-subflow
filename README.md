@@ -117,6 +117,57 @@ docker compose up -d
 
 ---
 
+## 本地部署（pip / uv）
+
+不想用 Docker、想直接在主机/服务器上跑时用这个。统一入口是 `python bot.py`，pip 和 uv 两条路只差"建环境 + 装依赖"那一步，其余完全一样。
+
+### 前置
+
+- Python ≥ 3.10
+- 一个 OneBot v11 实现（推荐 [NapCat](https://github.com/NapNeko/NapCatQQ)），与 Bot 网络可达
+- 腾讯文档凭据：单 key 填 `TENCENT_DOC_CLIENT_ID/OPEN_ID/ACCESS_TOKEN`，或多 key 填 `SUBFLOW_TENCENT_DOC_KEYS`（见上方配置项）
+
+### 1. 拉代码 + 配置
+
+```bash
+git clone <仓库地址> nonebot-plugin-subflow
+cd nonebot-plugin-subflow
+cp .env.example .env        # Windows: copy .env.example .env
+```
+
+编辑 `.env` 填好凭据等（至少填一套腾讯凭据；NapCat 连接见第 3 步）。
+
+### 2. 装依赖并启动（pip 或 uv，二选一）
+
+**pip：**
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
+pip install .
+python bot.py
+```
+
+**uv：**
+
+```bash
+# 装 uv 见 https://docs.astral.sh/uv/
+uv run python bot.py               # 自动选 Python、建 .venv、装依赖、启动
+# 或先预装再跑： uv sync && uv run python bot.py
+```
+
+> `uv run` / `uv sync` 会在仓库里生成 `uv.lock` 锁定依赖；不想入库可把它加进 `.gitignore`。
+
+### 3. 让 NapCat 连上来
+
+在 NapCat 里配置**反向 WebSocket**指向 `ws://<Bot主机>:8080/onebot/v11/ws`（端口由 `.env` 的 `PORT` 决定，默认 8080）。
+
+首次启动后会自动创建 `./data` 目录（存 `bindings.json` / `pipelines.json` / `episode_pipelines.json`）。然后在工作群发 `/绑定id ...` 即可开始使用（同上方 Docker 第 4 步）。
+
+> 注意：要在**含 `.env` 的目录**（仓库根）下运行 —— NoneBot 从当前工作目录读取 `.env`。`python bot.py` 是前台运行，关掉终端进程即停（需要常驻请自行用 systemd / nohup / NSSM 等）。
+
+---
+
 ## 命令速查
 
 > 写命令仅在工作群可用（D9）；查询命令工作群+总群均可。
