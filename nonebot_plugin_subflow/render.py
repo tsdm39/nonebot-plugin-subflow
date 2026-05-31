@@ -14,6 +14,17 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from .models import BindingEntry, Pipeline, Record
 from .pipeline import to_dsl
 from .task_manager import (
+    CHANGE_ABANDONED,
+    CHANGE_ARCHIVED,
+    CHANGE_ASSIGNEE_CHANGED,
+    CHANGE_ASSIGNEE_CLEARED,
+    CHANGE_ASSIGNEE_SET,
+    CHANGE_CLAIMED,
+    CHANGE_COMPLETED,
+    CHANGE_IN_PROGRESS,
+    CHANGE_PROGRESS_REGRESSED,
+    CHANGE_ROW_ADDED,
+    CHANGE_ROW_DELETED,
     COL_ASSIGNEE,
     COL_DONE_TIME,
     COL_EPISODE,
@@ -34,6 +45,8 @@ from .task_manager import (
     CreateEpisodeOutcome,
     DeleteOutcome,
     DeleteSummary,
+    ExternalChange,
+    ExternalChangeReport,
     InProgressOutcome,
     UpdateOutcome,
 )
@@ -134,8 +147,22 @@ def render_complete(outcome: CompleteOutcome) -> Message:
             f"\n🎉 {label} 现在可以接了 → {cmd}"
         )
 
+    # D17/Q8：已被接走的下游解锁 → @ 持有人提示可开工
+    for stage, seg, holder in outcome.newly_actionable_held:
+        held_label = stage if (not seg or seg == SEGMENT_NONE) else f"{stage} {seg}"
+        msg += MessageSegment.text("\n")
+        msg += assignee_segment(holder)
+        msg += MessageSegment.text(
+            f" 你的 {outcome.ref.show}{outcome.ref.episode} {held_label} "
+            f"前置已完成，可以开始了 ▶️"
+        )
+
     # 仍阻塞的下游（信息性）
-    if outcome.blocking_stages and not outcome.newly_unlocked_tasks:
+    if (
+        outcome.blocking_stages
+        and not outcome.newly_unlocked_tasks
+        and not outcome.newly_actionable_held
+    ):
         if outcome.same_stage_remaining == 0:
             blockers = "/".join(outcome.blocking_stages)
             msg += MessageSegment.text(
@@ -346,3 +373,129 @@ def render_pipeline_view(show: str, pipeline: Pipeline, is_default: bool) -> str
     dsl = to_dsl(pipeline)
     suffix = "（使用默认流水线）" if is_default else "（自定义流水线）"
     return f"{show} 工序链 {suffix}：\n  {dsl}"
+
+
+# ============================================================ external changes (D17)
+
+
+def _full_label(show: str, episode: str, stage: str, segment: str) -> str:
+    """形如「淡岛百景07 翻译 1」；不分段省略 segment。"""
+    base = f"{show}{episode} {stage}"
+    if segment and segment != SEGMENT_NONE:
+        return f"{base} {segment}"
+    return base
+
+
+def _external_change_line(ch: ExternalChange) -> Message:
+    """把一条 ExternalChange 渲染成一行（一个 Message，含 @ 段）。"""
+    label = _full_label(ch.show, ch.episode, ch.stage, ch.segment)
+    msg = Message()
+    if ch.kind == CHANGE_CLAIMED:
+        msg += assignee_segment(ch.assignee)
+        msg += MessageSegment.text(f" 接走了 {label}")
+    elif ch.kind == CHANGE_COMPLETED:
+        if ch.assignee:
+            msg += assignee_segment(ch.assignee)
+            msg += MessageSegment.text(f" 完成了 {label} ✅")
+        else:
+            msg += MessageSegment.text(f"{label} 已完成 ✅")
+    elif ch.kind == CHANGE_ABANDONED:
+        msg += MessageSegment.text(f"{label} 被放弃")
+        if ch.assignee:
+            msg += MessageSegment.text("（原 ")
+            msg += assignee_segment(ch.assignee)
+            msg += MessageSegment.text("）")
+        msg += MessageSegment.text("，重新可接")
+    elif ch.kind == CHANGE_IN_PROGRESS:
+        if ch.assignee:
+            msg += assignee_segment(ch.assignee)
+            msg += MessageSegment.text(f" 开始了 {label} 🔵")
+        else:
+            msg += MessageSegment.text(f"{label} 进行中 🔵")
+    elif ch.kind == CHANGE_ARCHIVED:
+        msg += MessageSegment.text(f"{label} 已归档 📦")
+    elif ch.kind == CHANGE_PROGRESS_REGRESSED:
+        msg += MessageSegment.text(
+            f"{label} 进度被改为「{ch.new_progress}」（原「{ch.old_progress}」）"
+        )
+    elif ch.kind == CHANGE_ASSIGNEE_SET:
+        msg += MessageSegment.text(f"{label} 组员被填为 ")
+        msg += assignee_segment(ch.assignee)
+    elif ch.kind == CHANGE_ASSIGNEE_CLEARED:
+        msg += MessageSegment.text(f"{label} 组员被清空（原 ")
+        msg += assignee_segment(ch.assignee)
+        msg += MessageSegment.text("）")
+    elif ch.kind == CHANGE_ASSIGNEE_CHANGED:
+        msg += MessageSegment.text(f"{label} 组员由 ")
+        msg += assignee_segment(ch.old_assignee)
+        msg += MessageSegment.text(" 改为 ")
+        msg += assignee_segment(ch.assignee)
+    elif ch.kind == CHANGE_ROW_ADDED:
+        unassigned = ch.new_progress in ("", PROGRESS_UNASSIGNED)
+        suffix = "（可接）" if unassigned else f"（{ch.new_progress}）"
+        msg += MessageSegment.text(f"新增任务：{label}{suffix}")
+    elif ch.kind == CHANGE_ROW_DELETED:
+        msg += MessageSegment.text(f"任务被删除：{label}")
+        if ch.assignee:
+            msg += MessageSegment.text("（原 ")
+            msg += assignee_segment(ch.assignee)
+            msg += MessageSegment.text("）")
+    else:  # 兜底
+        msg += MessageSegment.text(f"{label} 发生变更")
+    return msg
+
+
+def _unlock_unassigned_line(show: str, episode: str, stage: str, seg: str) -> Message:
+    if seg and seg != SEGMENT_NONE:
+        label = f"{stage} {seg}"
+        cmd = f"/接活 {show} {episode} {stage} {seg}"
+    else:
+        label = stage
+        cmd = f"/接活 {show} {episode} {stage}"
+    return Message(MessageSegment.text(f"🎉 {label} 现在可以接了 → {cmd}"))
+
+
+def _unlock_held_line(
+    show: str, episode: str, stage: str, seg: str, holder: str
+) -> Message:
+    label = _full_label(show, episode, stage, seg)
+    msg = Message()
+    msg += assignee_segment(holder)
+    msg += MessageSegment.text(f" 你的 {label} 前置已完成，可以开始了 ▶️")
+    return msg
+
+
+def render_external_changes(
+    report: ExternalChangeReport, *, digest_threshold: int = 5
+) -> list[Message]:
+    """D17：把外部变更报告渲染成群消息。
+
+    本群本轮总行数 ≤ digest_threshold → 逐条发（每条一条 Message，可单独 @）；
+    > digest_threshold → 合并成一条多行汇总，防刷屏。空报告返回 []。
+    """
+    lines: list[Message] = [
+        _external_change_line(ch) for ch in report.changes
+    ]
+    for episode, stage, seg in report.unlocked_unassigned:
+        lines.append(_unlock_unassigned_line(report.show, episode, stage, seg))
+    for episode, stage, seg, holder in report.unlocked_held:
+        lines.append(_unlock_held_line(report.show, episode, stage, seg, holder))
+
+    if not lines:
+        return []
+    if len(lines) <= digest_threshold:
+        out: list[Message] = []
+        for ln in lines:
+            m = Message(MessageSegment.text("📝 "))
+            m += ln
+            out.append(m)
+        return out
+    digest = Message(
+        MessageSegment.text(
+            f"📝 检测到「{report.show}」表格被直接修改 {len(lines)} 处："
+        )
+    )
+    for ln in lines:
+        digest += MessageSegment.text("\n")
+        digest += ln
+    return [digest]

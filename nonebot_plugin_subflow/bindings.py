@@ -138,6 +138,13 @@ class BindingStore:
     def get(self, alias: str) -> BindingEntry | None:
         return self._bindings.get(alias)
 
+    def get_by_sheet(self, file_id: str, sheet_id: str) -> BindingEntry | None:
+        """按 (file_id, sheet_id) 反查绑定（D17：把同步 diff 映射回工作群）。"""
+        for e in self._bindings.values():
+            if e.file_id == file_id and e.sheet_id == sheet_id:
+                return e
+        return None
+
     def get_for_group(self, group_id: int) -> list[BindingEntry]:
         return [e for e in self._bindings.values() if e.group_id == group_id]
 

@@ -72,6 +72,9 @@ class Config(BaseModel):
     subflow_confirm_timeout: int = 30  # 秒
     subflow_token_warn_days: int = 7  # 天
     subflow_data_dir: str = "./data"
+    # D17：外部表格变更检测与提醒
+    subflow_notify_external_changes: bool = True  # 同步时检测人工直改并播报到工作群
+    subflow_external_change_digest_threshold: int = 5  # 每群本轮变更 > 此数则汇总成一条
     subflow_default_pipeline: str = (
         "翻译[分段] → 时轴[分段] → 校对 → 后期 → 监制 → 压制"
     )

@@ -19,6 +19,7 @@ from nonebot_plugin_subflow.render import (
     render_create_episode,
     render_delete_done,
     render_delete_summary,
+    render_external_changes,
     render_in_progress,
     render_my_tasks,
     render_pipeline_view,
@@ -26,6 +27,9 @@ from nonebot_plugin_subflow.render import (
     render_update,
 )
 from nonebot_plugin_subflow.task_manager import (
+    CHANGE_CLAIMED,
+    CHANGE_COMPLETED,
+    CHANGE_ROW_ADDED,
     COL_ASSIGNEE,
     COL_DONE_TIME,
     COL_EPISODE,
@@ -44,6 +48,8 @@ from nonebot_plugin_subflow.task_manager import (
     CreateEpisodeOutcome,
     DeleteOutcome,
     DeleteSummary,
+    ExternalChange,
+    ExternalChangeReport,
     InProgressOutcome,
     TaskRef,
     UpdateOutcome,
@@ -260,6 +266,27 @@ def test_render_complete_with_blocking_stages_when_no_unlock() -> None:
     text = str(render_complete(outcome))
     assert "翻译 已全部完成" in text
     assert "等待其它前置完成后" in text
+
+
+def test_render_complete_ats_held_downstream_holder() -> None:
+    """D17/Q8：下游已被人接走 → @ 持有人「可以开始了」，不发"可接"广播。"""
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=0,
+        newly_unlocked_tasks=[],
+        newly_unlocked_stages=[],
+        blocking_stages=[],
+        newly_actionable_held=[("时轴", "1", "200")],
+    )
+    text = str(render_complete(outcome))
+    assert "[CQ:at,qq=200]" in text
+    assert "时轴 1" in text
+    assert "可以开始了" in text
+    assert "现在可以接了" not in text  # 不发广播
 
 
 def test_render_abandon_with_warning() -> None:
@@ -481,3 +508,60 @@ def test_render_pipeline_view_marks_custom() -> None:
     pipeline = parse_dsl("翻译 → 校对")
     text = render_pipeline_view("淡岛百景", pipeline, is_default=False)
     assert "自定义流水线" in text
+
+
+# ============================================================ external changes (D17)
+
+
+def _ext_change(kind: str, **kw) -> ExternalChange:
+    base = dict(show="淡岛百景", episode="07", stage="翻译", segment="1")
+    base.update(kw)
+    return ExternalChange(kind=kind, **base)
+
+
+def test_render_external_changes_per_line_under_threshold() -> None:
+    """事件数 ≤ 阈值 → 逐条发，每条单独一条带 📝 前缀的消息。"""
+    report = ExternalChangeReport(
+        show="淡岛百景",
+        changes=[
+            _ext_change(CHANGE_CLAIMED, assignee="100"),
+            _ext_change(CHANGE_COMPLETED, stage="时轴", assignee="200"),
+        ],
+    )
+    msgs = render_external_changes(report, digest_threshold=5)
+    assert len(msgs) == 2
+    texts = [str(m) for m in msgs]
+    assert all(t.startswith("📝") for t in texts)
+    assert any("接走了" in t and "[CQ:at,qq=100]" in t for t in texts)
+    assert any("完成了" in t and "[CQ:at,qq=200]" in t for t in texts)
+
+
+def test_render_external_changes_digest_over_threshold() -> None:
+    """事件数 > 阈值 → 合并成一条多行汇总。"""
+    report = ExternalChangeReport(
+        show="淡岛百景",
+        changes=[_ext_change(CHANGE_ROW_ADDED, segment="0", stage=f"工序{i}") for i in range(4)],
+    )
+    msgs = render_external_changes(report, digest_threshold=3)
+    assert len(msgs) == 1
+    text = str(msgs[0])
+    assert "检测到" in text and "4 处" in text
+    assert text.count("新增任务") == 4
+
+
+def test_render_external_changes_unlock_lines() -> None:
+    report = ExternalChangeReport(
+        show="淡岛百景",
+        unlocked_unassigned=[("07", "时轴", "1")],
+        unlocked_held=[("07", "校对", "0", "300")],
+    )
+    msgs = render_external_changes(report, digest_threshold=5)
+    joined = "\n".join(str(m) for m in msgs)
+    assert "现在可以接了" in joined
+    assert "/接活 淡岛百景 07 时轴 1" in joined
+    assert "[CQ:at,qq=300]" in joined
+    assert "可以开始了" in joined
+
+
+def test_render_external_changes_empty_returns_no_messages() -> None:
+    assert render_external_changes(ExternalChangeReport(show="X")) == []

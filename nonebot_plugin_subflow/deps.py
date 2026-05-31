@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from . import render
 from .bindings import BindingStore
-from .cache import SheetCache
+from .cache import SheetCache, SheetDiff
 from .config import Config
 from .pipeline import PipelineStore
 from .storage import TencentDocStorage
@@ -65,6 +66,8 @@ async def init(cfg: Config) -> None:
     cache = SheetCache(
         storage, sync_interval_minutes=cfg.subflow_sync_interval
     )
+    # D17：定时同步算出 diff 后，把外部变更播报到对应工作群
+    cache.on_sync_changes = _on_sync_changes
     bindings = BindingStore.load(
         data_dir / "bindings.json",
         main_group_id=cfg.subflow_main_group_id,
@@ -108,6 +111,41 @@ async def teardown() -> None:
         await cache.stop()
     if storage is not None:
         await storage.aclose()
+
+
+async def _on_sync_changes(diffs: dict[tuple[str, str], SheetDiff]) -> None:
+    """D17：定时同步检测到的外部表格变更 → 渲染并推送到对应工作群。
+
+    尽力而为：无 bot 连接 / 单群失败都只 log，不影响同步循环（cache 已包了一层）。
+    """
+    if config is None or not config.subflow_notify_external_changes:
+        return
+    if bindings is None or task_manager is None:
+        return
+    try:
+        from nonebot import get_bot
+
+        bot = get_bot()
+    except Exception:  # noqa: BLE001
+        log.warning("外部变更提醒：当前无可用 bot 连接，跳过本轮推送")
+        return
+
+    threshold = config.subflow_external_change_digest_threshold
+    for (file_id, sheet_id), diff in diffs.items():
+        entry = bindings.get_by_sheet(file_id, sheet_id)
+        if entry is None:
+            continue  # 未绑定的子表（理论上不会进到这）
+        try:
+            report = task_manager.interpret_external_changes(entry.alias, diff)
+            if report.is_empty():
+                continue
+            messages = render.render_external_changes(
+                report, digest_threshold=threshold
+            )
+            for msg in messages:
+                await bot.send_group_msg(group_id=entry.group_id, message=msg)
+        except Exception:  # noqa: BLE001
+            log.exception("外部变更提醒推送失败：%s", entry.alias)
 
 
 def require_task_manager() -> TaskManager:

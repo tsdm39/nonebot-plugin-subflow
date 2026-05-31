@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Iterable
 
 from .bindings import BindingStore
-from .cache import SheetCache
+from .cache import SheetCache, SheetDiff
 from .exceptions import StorageError
 from .models import BindingEntry, Pipeline, PipelineStage, Record
 from .pipeline import PipelineStore, downstream_of, predecessors_of, stage_names
@@ -52,6 +52,20 @@ SEGMENT_NONE = "0"  # D12：「不分段」字面值；替代旧的「全集」
 SEGMENT_WHOLE = SEGMENT_NONE  # 兼容别名，老引用都指向 "0"
 
 _TERMINAL_PROGRESS = {PROGRESS_DONE, PROGRESS_ARCHIVED}
+
+
+# D17：外部（绕过 bot 直改表格）变更的语义动作类型
+CHANGE_CLAIMED = "claimed"                    # 未分配 → 已分配
+CHANGE_COMPLETED = "completed"                # → 已完成
+CHANGE_ABANDONED = "abandoned"                # 已分配/进行中 → 未分配
+CHANGE_IN_PROGRESS = "in_progress"            # 已分配 → 进行中
+CHANGE_ARCHIVED = "archived"                  # → 归档
+CHANGE_PROGRESS_REGRESSED = "progress_regressed"  # 其它非常规流转（如已完成回退）
+CHANGE_ASSIGNEE_SET = "assignee_set"          # 进度未变，组员 空→X
+CHANGE_ASSIGNEE_CLEARED = "assignee_cleared"  # 进度未变，组员 X→空
+CHANGE_ASSIGNEE_CHANGED = "assignee_changed"  # 进度未变，组员 A→B
+CHANGE_ROW_ADDED = "row_added"                # 直接新增整行
+CHANGE_ROW_DELETED = "row_deleted"            # 直接删除整行
 
 
 # ============================================================ business exceptions
@@ -185,11 +199,13 @@ class CompleteOutcome:
     original_assignee_raw: str  # 完成前的「组员」字段值（QQ 数字串 或 昵称）
     sender_was_assignee: bool
     same_stage_remaining: int       # 同集同工序剩余未完成的段数
-    # D13：因此次完成而新解锁的下游任务，元素是 (stage, segment) — segment="0" 表示不分段
+    # D13：因此次完成而新解锁的「未分配」下游任务，元素是 (stage, segment) — segment="0" 表示不分段
     newly_unlocked_tasks: list[tuple[str, str]]
     # 兼容字段：上面 list 里去重后的 stage 名顺序
     newly_unlocked_stages: list[str]
     blocking_stages: list[str]      # 是下游、但仍因别的工序未完成而被阻塞
+    # D17/Q8：因此次完成而对「已被接走的下游」变为可开工，元素 (stage, segment, assignee)
+    newly_actionable_held: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -244,6 +260,41 @@ class ArchiveOutcome:
     episode: str
     archived: list[Record]
     skipped: list[Record]  # 不在「已完成」状态被略过的
+
+
+# ============================================================ external change (D17)
+
+
+@dataclass
+class ExternalChange:
+    """一条"人工绕过 bot 直改表格"的业务级变更（D17）。"""
+
+    kind: str
+    show: str
+    episode: str
+    stage: str
+    segment: str
+    assignee: str = ""       # 相关组员（新值；放弃/删除时为原组员）
+    old_assignee: str = ""   # 仅 ASSIGNEE_CHANGED 用
+    old_progress: str = ""   # 仅进度流转/回退展示用
+    new_progress: str = ""
+
+
+@dataclass
+class ExternalChangeReport:
+    """某番剧本轮同步检测到的全部外部变更 + 由此触发的下游解锁。"""
+
+    show: str
+    changes: list[ExternalChange] = field(default_factory=list)
+    # 因外部完成而新解锁、且仍「未分配」的下游 — (episode, stage, segment)
+    unlocked_unassigned: list[tuple[str, str, str]] = field(default_factory=list)
+    # 因外部完成而新解锁、但已被人接走的下游 — (episode, stage, segment, assignee)
+    unlocked_held: list[tuple[str, str, str, str]] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not (
+            self.changes or self.unlocked_unassigned or self.unlocked_held
+        )
 
 
 # ============================================================ confirmation state (D7)
@@ -586,28 +637,28 @@ class TaskManager:
             )
 
             # D13：per-(stage, segment) 粒度探测新解锁
+            # D17/Q8：未分配下游 → 广播"可接"（newly_unlocked_tasks）；
+            #         已被接走的下游 → @ 持有人"可开工"（newly_actionable_held）
             just_completed_segment = str(updated.values.get(COL_SEGMENT) or "")
             pred_segmented = _stage_is_segmented(pipeline, stage)
             newly_unlocked_tasks: list[tuple[str, str]] = []
+            newly_actionable_held: list[tuple[str, str, str]] = []
             still_blocked: list[str] = []
             for downstream in downstream_of(pipeline, stage):
                 ds_segmented = downstream.segment
-                # 候选下游记录：
+                # 候选下游记录：尚未完成（未分配 / 已分配 / 进行中）的那些
                 # - 同段-同段时仅检查与本次完成同段的那一条
-                # - 否则检查该下游 stage 的所有未分配记录
+                # - 否则检查该下游 stage 的所有候选
+                candidates = [
+                    r for r in post_records
+                    if r.values.get(COL_TYPE) == downstream.stage
+                    and r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
+                ]
                 if ds_segmented and pred_segmented:
                     candidates = [
-                        r for r in post_records
-                        if r.values.get(COL_TYPE) == downstream.stage
-                        and r.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED
-                        and normalize_segment(r.values.get(COL_SEGMENT, ""))
+                        r for r in candidates
+                        if normalize_segment(r.values.get(COL_SEGMENT, ""))
                             == normalize_segment(just_completed_segment)
-                    ]
-                else:
-                    candidates = [
-                        r for r in post_records
-                        if r.values.get(COL_TYPE) == downstream.stage
-                        and r.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED
                     ]
                 if not candidates:
                     continue
@@ -624,7 +675,13 @@ class TaskManager:
                         segment=check_seg,
                     )
                     if not was and is_now:
-                        newly_unlocked_tasks.append((downstream.stage, seg))
+                        if cand.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED:
+                            newly_unlocked_tasks.append((downstream.stage, seg))
+                        else:
+                            holder = str(cand.values.get(COL_ASSIGNEE) or "")
+                            newly_actionable_held.append(
+                                (downstream.stage, seg, holder)
+                            )
                     elif not is_now:
                         stage_blocked = True
                 if stage_blocked and downstream.stage not in still_blocked:
@@ -646,6 +703,7 @@ class TaskManager:
             newly_unlocked_tasks=newly_unlocked_tasks,
             newly_unlocked_stages=newly_unlocked_stage_names,
             blocking_stages=still_blocked,
+            newly_actionable_held=newly_actionable_held,
         )
 
     async def abandon_task(
@@ -984,6 +1042,167 @@ class TaskManager:
                 if rec.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED:
                     out.append((entry.alias, rec))
         return out
+
+    # ================================================== external change (D17)
+
+    def interpret_external_changes(
+        self, show: str, diff: SheetDiff
+    ) -> ExternalChangeReport:
+        """把 cache 的 SheetDiff 解释成有业务含义的外部变更（D17）。纯读，不写回。
+
+        - 改行 → 语义动作（接活/完成/放弃/进行中/归档/指派/清空组员/进度回退）；
+          仅备注/集数/分段/类型变化（进度+组员都没变）→ 丢弃。
+        - 增/删整行 → ROW_ADDED / ROW_DELETED。
+        - 本轮新变为终态（已完成/归档）的工序 → 触发下游解锁探测（同段/全段），
+          解锁的下游按当前进度分流：未分配→广播可接；已被接走→@ 持有人。
+        """
+        report = ExternalChangeReport(show=show)
+
+        for rec in diff.added:
+            report.changes.append(self._row_change(show, CHANGE_ROW_ADDED, rec))
+        for rec in diff.removed:
+            report.changes.append(
+                self._row_change(show, CHANGE_ROW_DELETED, rec)
+            )
+
+        # episode → 本轮新变为终态的工序名集合
+        completed_by_ep: dict[str, set[str]] = {}
+        for old_rec, new_rec in diff.changed:
+            change = self._interpret_changed(show, old_rec, new_rec)
+            if change is not None:
+                report.changes.append(change)
+            old_p = old_rec.values.get(COL_PROGRESS)
+            new_p = new_rec.values.get(COL_PROGRESS)
+            if new_p in _TERMINAL_PROGRESS and old_p not in _TERMINAL_PROGRESS:
+                ep = str(new_rec.values.get(COL_EPISODE, ""))
+                completed_by_ep.setdefault(ep, set()).add(
+                    str(new_rec.values.get(COL_TYPE, ""))
+                )
+
+        binding = self._bindings.get(show)
+        if binding is not None:
+            for ep, completed_stages in completed_by_ep.items():
+                self._collect_external_unlocks(
+                    show, binding, ep, completed_stages, report
+                )
+        return report
+
+    def _row_change(
+        self, show: str, kind: str, rec: Record
+    ) -> ExternalChange:
+        return ExternalChange(
+            kind=kind,
+            show=show,
+            episode=str(rec.values.get(COL_EPISODE, "")),
+            stage=str(rec.values.get(COL_TYPE, "")),
+            segment=str(rec.values.get(COL_SEGMENT, "")),
+            assignee=str(rec.values.get(COL_ASSIGNEE) or ""),
+            new_progress=str(rec.values.get(COL_PROGRESS) or ""),
+        )
+
+    def _interpret_changed(
+        self, show: str, old_rec: Record, new_rec: Record
+    ) -> ExternalChange | None:
+        old_p = str(old_rec.values.get(COL_PROGRESS) or "")
+        new_p = str(new_rec.values.get(COL_PROGRESS) or "")
+        old_a = str(old_rec.values.get(COL_ASSIGNEE) or "")
+        new_a = str(new_rec.values.get(COL_ASSIGNEE) or "")
+        base = dict(
+            show=show,
+            episode=str(new_rec.values.get(COL_EPISODE, "")),
+            stage=str(new_rec.values.get(COL_TYPE, "")),
+            segment=str(new_rec.values.get(COL_SEGMENT, "")),
+        )
+        if new_p != old_p:
+            if new_p == PROGRESS_DONE:
+                kind = CHANGE_COMPLETED
+            elif new_p == PROGRESS_ARCHIVED:
+                kind = CHANGE_ARCHIVED
+            elif new_p == PROGRESS_IN_PROGRESS and old_p == PROGRESS_ASSIGNED:
+                kind = CHANGE_IN_PROGRESS
+            elif new_p == PROGRESS_ASSIGNED and old_p == PROGRESS_UNASSIGNED:
+                return ExternalChange(
+                    kind=CHANGE_CLAIMED, assignee=new_a,
+                    old_progress=old_p, new_progress=new_p, **base
+                )
+            elif new_p == PROGRESS_UNASSIGNED and old_p in (
+                PROGRESS_ASSIGNED, PROGRESS_IN_PROGRESS
+            ):
+                return ExternalChange(
+                    kind=CHANGE_ABANDONED, assignee=old_a,
+                    old_progress=old_p, new_progress=new_p, **base
+                )
+            else:
+                kind = CHANGE_PROGRESS_REGRESSED
+            return ExternalChange(
+                kind=kind, assignee=(new_a or old_a),
+                old_progress=old_p, new_progress=new_p, **base
+            )
+        # 进度未变 → 看组员
+        if new_a != old_a:
+            if not old_a:
+                return ExternalChange(
+                    kind=CHANGE_ASSIGNEE_SET, assignee=new_a, **base
+                )
+            if not new_a:
+                return ExternalChange(
+                    kind=CHANGE_ASSIGNEE_CLEARED, assignee=old_a, **base
+                )
+            return ExternalChange(
+                kind=CHANGE_ASSIGNEE_CHANGED,
+                assignee=new_a, old_assignee=old_a, **base
+            )
+        # 进度、组员都没变 → 仅备注/集数/分段/类型变化 → 不在范围
+        return None
+
+    def _collect_external_unlocks(
+        self,
+        show: str,
+        binding: BindingEntry,
+        episode: str,
+        completed_stages: set[str],
+        report: ExternalChangeReport,
+    ) -> None:
+        """对本集"本轮新完成的工序"探测新解锁的下游（复用 _is_stage_unlocked）。
+
+        只迭代刚完成工序的下游，故"该下游确因本轮完成而解锁"天然成立；
+        _is_stage_unlocked 再保证同段/全段语义和"全部前置都满足"。
+        """
+        pipeline = self._pipelines.get_episode_pipeline(show, episode)
+        post_records = self._episode_records(binding, episode)
+        seen_unassigned: set[tuple[str, str]] = set()
+        seen_held: set[tuple[str, str, str]] = set()
+        for cstage in completed_stages:
+            for downstream in downstream_of(pipeline, cstage):
+                ds_segmented = downstream.segment
+                candidates = [
+                    r for r in post_records
+                    if r.values.get(COL_TYPE) == downstream.stage
+                    and r.values.get(COL_PROGRESS) not in _TERMINAL_PROGRESS
+                ]
+                for cand in candidates:
+                    seg = str(cand.values.get(COL_SEGMENT) or "")
+                    check_seg = seg if ds_segmented else None
+                    if not self._is_stage_unlocked(
+                        pipeline, post_records, downstream.stage,
+                        segment=check_seg,
+                    ):
+                        continue
+                    if cand.values.get(COL_PROGRESS) == PROGRESS_UNASSIGNED:
+                        key = (downstream.stage, seg)
+                        if key not in seen_unassigned:
+                            seen_unassigned.add(key)
+                            report.unlocked_unassigned.append(
+                                (episode, downstream.stage, seg)
+                            )
+                    else:
+                        holder = str(cand.values.get(COL_ASSIGNEE) or "")
+                        hkey = (downstream.stage, seg, holder)
+                        if hkey not in seen_held:
+                            seen_held.add(hkey)
+                            report.unlocked_held.append(
+                                (episode, downstream.stage, seg, holder)
+                            )
 
     # ================================================== internal helpers
 

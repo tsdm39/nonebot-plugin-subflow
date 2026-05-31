@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from nonebot_plugin_subflow.cache import SheetCache
+from nonebot_plugin_subflow.cache import SheetCache, SheetDiff
 from nonebot_plugin_subflow.exceptions import RecordNotFoundError
 from nonebot_plugin_subflow.models import FieldSchema, Record
 from nonebot_plugin_subflow.storage.base import StorageBackend
@@ -308,7 +308,11 @@ async def test_refresh_all_iterates_all_sheets(
     await cache.add_sheet(*F2)
     fake.calls.clear()
     results = await cache.refresh_all()
-    assert results == {F: 1, F2: 2}
+    # 数据未变 → 两表都是空 diff
+    assert set(results.keys()) == {F, F2}
+    assert all(
+        isinstance(d, SheetDiff) and d.is_empty() for d in results.values()
+    )
     assert cache.last_sync_at is not None
 
 
@@ -321,7 +325,74 @@ async def test_refresh_all_continues_on_single_sheet_failure(
     cache._sheets[F2] = {}  # type: ignore[attr-defined]
     # leave F2 not configured in storage → get_records returns []
     results = await cache.refresh_all()
-    assert results[F] == 1
+    assert isinstance(results[F], SheetDiff)
+
+
+# =================================================================== D17 diff
+
+V_UNASSIGNED = {"进度": "未分配", "组员": ""}
+
+
+async def test_refresh_sheet_diff_first_load_is_empty(
+    fake: FakeStorage, cache: SheetCache
+) -> None:
+    """子表此前不在缓存（首次加载）→ 空 diff，不把存量行当变更。"""
+    fake.configure(*F, records=[Record("a", dict(V_UNASSIGNED))])
+    diff = await cache.refresh_sheet_diff(*F)
+    assert diff.is_empty()
+
+
+async def test_refresh_sheet_diff_detects_added_changed_removed(
+    fake: FakeStorage, cache: SheetCache
+) -> None:
+    fake.configure(
+        *F,
+        records=[
+            Record("a", {"进度": "未分配", "组员": ""}),
+            Record("b", {"进度": "已分配", "组员": "100"}),
+        ],
+    )
+    await cache.add_sheet(*F)
+    # 外部直改：a 被接走、b 整行删除、新增 c
+    fake.records[F] = {
+        "a": Record("a", {"进度": "已分配", "组员": "200"}),
+        "c": Record("c", {"进度": "未分配", "组员": ""}),
+    }
+    diff = await cache.refresh_sheet_diff(*F)
+    assert [r.record_id for r in diff.added] == ["c"]
+    assert [r.record_id for r in diff.removed] == ["b"]
+    assert len(diff.changed) == 1
+    old, new = diff.changed[0]
+    assert old.record_id == "a" and old.values["组员"] == ""
+    assert new.values["组员"] == "200"
+    # 覆盖后缓存为新值
+    assert cache.get_record(*F, "a").values["组员"] == "200"
+
+
+async def test_sync_loop_invokes_on_sync_changes(fake: FakeStorage) -> None:
+    """_sync_loop 跑完一轮把非空 diff 交给回调。"""
+    cache = SheetCache(fake, sync_interval_minutes=99999)
+    cache._sync_interval_seconds = 0.02  # type: ignore[attr-defined]  # 加速触发
+    fake.configure(*F, records=[Record("a", {"进度": "未分配"})])
+    await cache.add_sheet(*F)
+    captured: list[dict] = []
+
+    async def on_changes(diffs):
+        captured.append(diffs)
+
+    cache.on_sync_changes = on_changes
+    # 外部改动
+    fake.records[F] = {"a": Record("a", {"进度": "已完成"})}
+    await cache.start()
+    # 轮询等回调被调用
+    for _ in range(50):
+        if captured:
+            break
+        await asyncio.sleep(0.01)
+    await cache.stop()
+    assert captured, "on_sync_changes 未被调用"
+    assert F in captured[0]
+    assert not captured[0][F].is_empty()
 
 
 # =================================================================== periodic task lifecycle

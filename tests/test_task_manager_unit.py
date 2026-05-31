@@ -9,10 +9,17 @@ from pathlib import Path
 import pytest
 
 from nonebot_plugin_subflow.bindings import BindingStore
-from nonebot_plugin_subflow.cache import SheetCache
+from nonebot_plugin_subflow.cache import SheetCache, SheetDiff
 from nonebot_plugin_subflow.exceptions import AliasNotFoundError
+from nonebot_plugin_subflow.models import Record
 from nonebot_plugin_subflow.pipeline import PipelineStore, parse_dsl
 from nonebot_plugin_subflow.task_manager import (
+    CHANGE_ABANDONED,
+    CHANGE_ASSIGNEE_SET,
+    CHANGE_CLAIMED,
+    CHANGE_COMPLETED,
+    CHANGE_ROW_ADDED,
+    CHANGE_ROW_DELETED,
     COL_ASSIGNEE,
     COL_DONE_TIME,
     COL_EPISODE,
@@ -740,3 +747,129 @@ async def test_d13_unsegmented_pipeline_unaffected(arrow_tm: TaskManager) -> Non
     await arrow_tm.claim_task(SHOW, "07", "翻译", "1", user_qq=100)
     o = await arrow_tm.complete_task(SHOW, "07", "翻译", "1", user_qq=100)
     assert ("时轴", "1") in o.newly_unlocked_tasks
+
+
+# ============================================================ D17/Q8: 完成时 @ 已被接走的下游
+
+
+async def test_complete_unlocks_held_downstream_for_holder(
+    arrow_tm: TaskManager,
+) -> None:
+    """提前接了 时轴 1（held），完成 翻译 1 后 → 该下游进 newly_actionable_held，不进 unassigned。"""
+    await arrow_tm.create_episode(SHOW, "07", 3)
+    # 200 提前接 时轴 1（D15 允许），此时还做不了
+    await arrow_tm.claim_task(SHOW, "07", "时轴", "1", user_qq=200)
+    # 100 接并完成 翻译 1
+    await arrow_tm.claim_task(SHOW, "07", "翻译", "1", user_qq=100)
+    o = await arrow_tm.complete_task(SHOW, "07", "翻译", "1", user_qq=100)
+    assert ("时轴", "1", "200") in o.newly_actionable_held
+    # 已被接走的不应再当"未分配可接"广播
+    assert ("时轴", "1") not in o.newly_unlocked_tasks
+
+
+# ============================================================ D17: interpret_external_changes
+
+
+def _ext_rec(
+    stage: str,
+    episode: str,
+    segment: str,
+    progress: str,
+    assignee: str = "",
+    record_id: str = "x",
+) -> Record:
+    return Record(
+        record_id=record_id,
+        values={
+            COL_TYPE: stage,
+            COL_EPISODE: episode,
+            COL_SEGMENT: segment,
+            COL_PROGRESS: progress,
+            COL_ASSIGNEE: assignee,
+            COL_REMARK: "",
+        },
+    )
+
+
+def test_interpret_external_claim(tm: TaskManager) -> None:
+    """组员+进度一次改成已分配 → 一条 CHANGE_CLAIMED（合并，不拆字段）。"""
+    old = _ext_rec("翻译", "07", "1", PROGRESS_UNASSIGNED, "")
+    new = _ext_rec("翻译", "07", "1", PROGRESS_ASSIGNED, "100")
+    report = tm.interpret_external_changes(SHOW, SheetDiff(changed=[(old, new)]))
+    assert len(report.changes) == 1
+    assert report.changes[0].kind == CHANGE_CLAIMED
+    assert report.changes[0].assignee == "100"
+
+
+def test_interpret_external_assignee_set_without_progress(tm: TaskManager) -> None:
+    """只手填组员、进度没动 → CHANGE_ASSIGNEE_SET。"""
+    old = _ext_rec("翻译", "07", "1", PROGRESS_UNASSIGNED, "")
+    new = _ext_rec("翻译", "07", "1", PROGRESS_UNASSIGNED, "小明")
+    report = tm.interpret_external_changes(SHOW, SheetDiff(changed=[(old, new)]))
+    assert [c.kind for c in report.changes] == [CHANGE_ASSIGNEE_SET]
+    assert report.changes[0].assignee == "小明"
+
+
+def test_interpret_ignores_remark_only_change(tm: TaskManager) -> None:
+    """只改备注（进度、组员都没动）→ 不产生任何事件。"""
+    old = _ext_rec("翻译", "07", "1", PROGRESS_ASSIGNED, "100")
+    new = _ext_rec("翻译", "07", "1", PROGRESS_ASSIGNED, "100")
+    new.values[COL_REMARK] = "加急"
+    report = tm.interpret_external_changes(SHOW, SheetDiff(changed=[(old, new)]))
+    assert report.is_empty()
+
+
+def test_interpret_row_add_and_delete(tm: TaskManager) -> None:
+    added = _ext_rec("校对", "07", "0", PROGRESS_UNASSIGNED, "")
+    removed = _ext_rec("时轴", "07", "2", PROGRESS_ASSIGNED, "100")
+    report = tm.interpret_external_changes(
+        SHOW, SheetDiff(added=[added], removed=[removed])
+    )
+    kinds = {c.kind for c in report.changes}
+    assert kinds == {CHANGE_ROW_ADDED, CHANGE_ROW_DELETED}
+
+
+async def test_interpret_external_completion_unlocks_unassigned(
+    arrow_setup, arrow_tm: TaskManager
+) -> None:
+    """外部把 翻译 1 标完成 → 报告含 COMPLETED + 时轴 1 进 unlocked_unassigned。"""
+    cache = arrow_setup["cache"]
+    fake = arrow_setup["fake"]
+    await arrow_tm.create_episode(SHOW, "07", 3)
+    # 找到 翻译 1 的真实 record_id，外部直改其进度为已完成
+    fanyi1 = next(
+        r for r in cache.get_records("F", "S")
+        if r.values[COL_TYPE] == "翻译" and r.values[COL_SEGMENT] == "1"
+    )
+    fake.records[("F", "S")][fanyi1.record_id] = Record(
+        record_id=fanyi1.record_id,
+        values={**fanyi1.values, COL_PROGRESS: PROGRESS_DONE},
+    )
+    diff = await cache.refresh_sheet_diff("F", "S")
+    report = arrow_tm.interpret_external_changes(SHOW, diff)
+    assert any(c.kind == CHANGE_COMPLETED and c.stage == "翻译" for c in report.changes)
+    assert ("07", "时轴", "1") in report.unlocked_unassigned
+    # 时轴 2/3 未解锁（对应 翻译 2/3 没完成）
+    assert ("07", "时轴", "2") not in report.unlocked_unassigned
+
+
+async def test_interpret_external_completion_ats_held_downstream(
+    arrow_setup, arrow_tm: TaskManager
+) -> None:
+    """下游 时轴 1 已被 200 接走时，外部完成 翻译 1 → 进 unlocked_held（带持有人）。"""
+    cache = arrow_setup["cache"]
+    fake = arrow_setup["fake"]
+    await arrow_tm.create_episode(SHOW, "07", 3)
+    await arrow_tm.claim_task(SHOW, "07", "时轴", "1", user_qq=200)
+    fanyi1 = next(
+        r for r in cache.get_records("F", "S")
+        if r.values[COL_TYPE] == "翻译" and r.values[COL_SEGMENT] == "1"
+    )
+    fake.records[("F", "S")][fanyi1.record_id] = Record(
+        record_id=fanyi1.record_id,
+        values={**fanyi1.values, COL_PROGRESS: PROGRESS_DONE},
+    )
+    diff = await cache.refresh_sheet_diff("F", "S")
+    report = arrow_tm.interpret_external_changes(SHOW, diff)
+    assert ("07", "时轴", "1", "200") in report.unlocked_held
+    assert ("07", "时轴", "1") not in report.unlocked_unassigned

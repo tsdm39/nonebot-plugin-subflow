@@ -210,6 +210,32 @@ NoneBot2 通过 Pydantic BaseSettings 读取 `.env` 时，`KEY=` 得到的是空
 - `render_claim` / `render_complete` / `render_abandon` / `render_in_progress` 早已用 `assignee_segment`，不受影响
 - 测试：相关断言由 `"@100"` 改为 `"[CQ:at,qq=100]"`，并用 `str(msg)` 取文本
 
+### D17 · 外部表格变更检测与群内提醒（追加）
+
+人工绕过 bot 直接在腾讯文档智能表里改数据（手填组员、改进度、标完成、增删行）此前完全静默：缓存只在定时同步时整表覆盖，不比对差异、不发消息；依赖解锁只在 `/完成` 命令路径里跑，手改"已完成"不触发下游提示。本决策在**定时同步那一刻 diff 出人工改动**，按业务语义在对应**工作群**播报，并对手动完成触发下游解锁。
+
+经 grilling 敲定 9 条：
+
+1. **范围**：进度流转（含回退）、组员变化、整行增删；忽略备注/集数/分段/类型这类纯编辑。
+2. **粒度（防刷屏）**：每群本轮变更 ≤ 阈值 N 逐条发、> N 合成一条汇总；N 可配置（默认 5）。
+3. **手动完成 → 下游解锁**：复用 `_is_stage_unlocked` 按同段/全段算新解锁工序。
+4. **频率**：复用现有 `SUBFLOW_SYNC_INTERVAL`（默认 30 分钟）同步周期，零额外 API；延迟 ≤ 一个同步周期。
+5. **开关**：`SUBFLOW_NOTIFY_EXTERNAL_CHANGES`（默认 `true`）+ `SUBFLOW_EXTERNAL_CHANGE_DIGEST_THRESHOLD`（默认 `5`）。
+6. **分层**：`cache` 出结构化 `SheetDiff`（仍不依赖 NoneBot）→ `task_manager.interpret_external_changes` 纯函数解释成业务事件（含下游解锁）→ `deps._on_sync_changes` 回调用 `render.render_external_changes` 渲染、`get_bot().send_group_msg` 发到工作群。
+7. **@ 行为**：变更涉及数字 QQ 组员则 @；下游"可接"未分配则广播不 @，已被人接走则 @ 持有人「前置已完成，可以开始了」；昵称按文本。
+8. **路径统一**：第 7 条"下游已被接走 → @ 持有人"对 bot `/完成` 和外部完成两条路径都适用——`complete_task` 增字段 `newly_actionable_held`，顺带补上 D15「可提前接活」留下的提醒缺口。
+9. **播报粒度**：按语义动作（接活/完成/放弃/进行中/归档/指派/清空组员/新增/删除）播报，同一动作合成一行。
+
+**默认敲定的边界**：检测只读不回写；冷启动 / 运行时新加子表无旧快照 → 空 diff 不播报；diff 在覆盖缓存前算；只推工作群（总群无绑定天然不收）；阈值按每群计；发送尽力而为（无 bot / 单群失败只 log）；外部变更消息带 `📝` 前缀。
+
+**待修改文件清单**：
+- `config.py`：加上述两个字段（`_empty_str_to_none` 自动兜底空串）
+- `cache.py`：新增 `SheetDiff`；`refresh_sheet_diff` 覆盖前算 diff；`refresh_all` 返回 `{ref: SheetDiff|Exception}`；`_sync_loop` 完一轮调 `on_sync_changes` 回调
+- `task_manager.py`：`CHANGE_*` 常量、`ExternalChange` / `ExternalChangeReport`、`interpret_external_changes` + `_interpret_changed` / `_collect_external_unlocks`；`complete_task` 收集 `newly_actionable_held`
+- `render.py`：`render_external_changes`（逐条/汇总）；`render_complete` 增"@ 已被接走的下游持有人"行
+- `bindings.py`：`get_by_sheet(file_id, sheet_id)` 反查
+- `deps.py`：`_on_sync_changes` 回调接线（init 里 `cache.on_sync_changes = _on_sync_changes`）
+
 ---
 
 ## 三、项目结构（增量于原设计文档 5.2）
@@ -246,6 +272,8 @@ TENCENT_DOC_CLIENT_ID=
 # 行为开关
 SUBFLOW_CONFIRM_TIMEOUT=30        # /删除任务 确认窗口秒数（D7）
 SUBFLOW_TOKEN_WARN_DAYS=7         # token 距过期多少天开始提醒（D2）
+SUBFLOW_NOTIFY_EXTERNAL_CHANGES=true            # 同步时检测人工直改表格并播报（D17）
+SUBFLOW_EXTERNAL_CHANGE_DIGEST_THRESHOLD=5      # 每群本轮变更 > 此数则汇总成一条（D17）
 ```
 
 ---
